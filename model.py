@@ -85,6 +85,7 @@ class LayerStacks(nn.Module):
         self.output.bias = nn.Parameter(output_bias)
 
     def forward(self, x, ls_indices):
+        out = {}
         # Precompute and cache the offset for gathers
         if self.idx_offset == None or self.idx_offset.shape[0] != x.shape[0]:
             self.idx_offset = torch.arange(
@@ -93,8 +94,13 @@ class LayerStacks(nn.Module):
 
         indices = ls_indices.flatten() + self.idx_offset
 
-        l1s_ = self.l1(x).reshape((-1, self.count, L2 + 1))
+        l1s_ = self.l1(x)
+        out["l1"] = l1s_.clone().detach()
+        l1s_ = l1s_.reshape((-1, self.count, L2 + 1))
+
         l1f_ = self.l1_fact(x)
+        out["l1_fact"] = l1f_.clone().detach()
+
         # https://stackoverflow.com/questions/55881002/pytorch-tensor-indexing-how-to-gather-rows-by-tensor-containing-indices
         # basically we present it as a list of individual results and pick not only based on
         # the ls index but also based on batch (they are combined into one index)
@@ -107,15 +113,19 @@ class LayerStacks(nn.Module):
             torch.cat([torch.pow(l1x_, 2.0) * (127 / 128), l1x_], dim=1), 0.0, 1.0
         )
 
-        l2s_ = self.l2(l1x_).reshape((-1, self.count, L3))
+        l2s_ = self.l2(l1x_)
+        out["l2"] = l2s_.clone().detach()
+        l2s_ = l2s_.reshape((-1, self.count, L3))
         l2c_ = l2s_.view(-1, L3)[indices]
         l2x_ = torch.clamp(l2c_, 0.0, 1.0)
 
-        l3s_ = self.output(l2x_).reshape((-1, self.count, 1))
+        l3s_ = self.output(l2x_)
+        out["output"] = l3s_.clone().detach()
+        l3s_ = l3s_.reshape((-1, self.count, 1))
         l3c_ = l3s_.view(-1, 1)[indices]
         l3x_ = l3c_ + l1f_out + l1c_out
 
-        return l3x_
+        return l3x_, out
 
     def get_coalesced_layer_stacks(self):
         # During training the buckets are represented by a single, wider, layer.
@@ -360,9 +370,10 @@ class NNUE(pl.LightningModule):
         # The PSQT values are averaged over perspectives. "Their" perspective
         # has a negative influence (us-0.5 is 0.5 for white and -0.5 for black,
         # which does both the averaging and sign flip for black to move)
-        x = self.layer_stacks(l0_, layer_stack_indices) + (wpsqt - bpsqt) * (us - 0.5)
-
-        return x
+        x, embed = self.layer_stacks(l0_, layer_stack_indices)
+        x = x + (wpsqt - bpsqt) * (us - 0.5)
+        embed["position"] = l0_.clone().detach()
+        return x, embed
 
     def step_(self, batch, batch_idx, loss_type):
         # We clip weights at the start of each step. This means that after
